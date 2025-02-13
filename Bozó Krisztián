@@ -1,0 +1,113 @@
+import requests
+from bs4 import BeautifulSoup
+from urllib.request import urlopen
+from time import sleep
+from sys import argv
+
+RESULTS_MAX = 50
+SEARCH_BASE = 'http://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?retmax={}&term={}'
+PUBMED_BASE = 'http://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&id='
+PUBMED_DELAY = 0.3
+AUTHORS_MAX = 3
+TABLE_MARGIN = 1
+TARGET_SECTIONS = ["Materials and methods", "Experimental section", "Methods"]
+USER_AGENT = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
+
+def fetch_pmc_id(pubmed_id):
+    """Lekéri a PMC ID-t egy adott PubMed ID-hez."""
+    pubmed_sum = urlopen(PUBMED_BASE + pubmed_id)
+    pubmed_bs = BeautifulSoup(pubmed_sum, 'xml')
+    try:
+        return pubmed_bs.PubmedData.ArticleIdList.find("ArticleId", {'IdType': "pmc"}).text
+    except AttributeError:
+        return None
+
+def find_target_section(soup):
+    """Megkeresi az első megfelelő főszekciót a cikkben."""
+    sections = soup.find_all(["h1", "h2", "h3"])
+    for section in sections:
+        section_text = section.get_text(strip=True).lower()
+        if any(target.lower() in section_text for target in TARGET_SECTIONS):
+            return section
+    return None
+
+def extract_experimental_section(soup):
+    """Lekéri és kimenti a megfelelő főszekciót és alszekcióit a PMC cikkből."""
+    sections = soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "p"])
+    
+    # Az összes főszekció kigyűjtése
+    target_section = None
+    for section in sections:
+        section_text = section.get_text(strip=True).lower()
+        if any(target.lower() in section_text for target in TARGET_SECTIONS):
+            target_section = section
+            break
+    
+    if not target_section:
+        return None
+    
+    extracted_text = []
+    current_section_level = target_section.name
+    for section in target_section.find_all_next(["h1", "h2", "h3", "h4", "h5", "h6", "p"]):
+        section_text = section.get_text(strip=True)
+        
+        # Ha új főszekció kezdődik, kilépünk
+        if section.name in ["h1", "h2", "h3"] and section.name <= current_section_level:
+            break 
+        
+        extracted_text.append(section_text)
+    
+    return "\n".join(extracted_text) if extracted_text else None
+
+def process_article(pmc_id):
+    """Feldolgozza a cikket és kimenti a megfelelő szekciót."""
+    pmc_url = f"https://pmc.ncbi.nlm.nih.gov/articles/{pmc_id}/"
+    response = requests.get(pmc_url, headers=USER_AGENT)
+    
+    if response.status_code == 200:
+        soup = BeautifulSoup(response.text, "html.parser")
+        return extract_experimental_section(soup)
+    return None
+
+def main():
+    output_filename = "output.txt"
+    with open(argv[1]) as kw_file:
+        keywords = [kw.strip() for kw in kw_file.readlines()]
+    
+    with open(output_filename, "w", encoding="utf-8") as file:
+        for kw in keywords:
+            print(f"Searching for {kw}")
+            kw_ids = {}
+            count = collect_ids(kw, kw_ids)
+            print(f"{len(kw_ids)} items for {kw}")
+            
+            for i, pubmed_id in enumerate(list(kw_ids.keys())[:RESULTS_MAX]):
+                pmc_id = fetch_pmc_id(pubmed_id)
+                if not pmc_id:
+                    continue  # Skip articles without full text PMC link
+                
+                extracted_text = process_article(pmc_id)
+                if extracted_text:
+                    file.write(f"URL: https://www.ncbi.nlm.nih.gov/pmc/articles/{pmc_id}/\n\n")
+                    file.write(extracted_text + "\n\n")
+                    print(f"Saved section for PMC ID: {pmc_id}")
+                
+                sleep(PUBMED_DELAY)
+
+def collect_ids(kw, kw_ids):
+    term = '+'.join(kw.split(' '))
+    search_res = urlopen(SEARCH_BASE.format(RESULTS_MAX, term))
+    search_bs = BeautifulSoup(search_res, 'xml')
+    results_count = int(search_bs.Count.text)
+    print(f"Hits for {kw}: {results_count}")
+    sleep(PUBMED_DELAY)
+    
+    for pmid in search_bs.find_all('Id'):
+        try:
+            kw_ids[pmid.text].append(kw)
+        except KeyError:
+            kw_ids[pmid.text] = [kw]
+    return results_count
+
+if __name__ == '__main__':
+    main()
